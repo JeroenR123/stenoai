@@ -10,11 +10,18 @@
   },
   "scripts": {
     "start": "electron .",
+    "build:macos-insertion-helper": "../scripts/build-macos-insertion-helper.sh",
+    "prebuild": "npm run build:macos-insertion-helper",
     "build": "electron-builder",
+    "prebuild-mac": "npm run build:macos-insertion-helper",
     "build-mac": "electron-builder --mac",
+    "prebuild:intel": "npm run build:macos-insertion-helper",
     "build:intel": "electron-builder --mac --x64",
+    "prebuild:arm64": "npm run build:macos-insertion-helper",
     "build:arm64": "electron-builder --mac --arm64",
+    "predist": "npm run build:macos-insertion-helper",
     "dist": "electron-builder --publish=never",
+    "prepack": "npm run build:macos-insertion-helper",
     "pack": "electron-builder --dir",
     "release": "electron-builder --publish=always",
     "version:patch": "npm version patch && git push && git push --tags",
@@ -75,6 +82,10 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "../bin/macos-insertion-helper",
+        "to": "helpers/macos-insertion-helper"
       },
       {
         "from": "assets",

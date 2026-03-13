@@ -334,6 +334,24 @@
             box-shadow: 0 0 28px var(--recording-glow);
         }
 
+        .btn-dictation {
+            color: var(--remote-cyan);
+            border-color: rgba(6, 182, 212, 0.35);
+            background: linear-gradient(135deg, rgba(6, 182, 212, 0.14) 0%, rgba(99, 102, 241, 0.12) 100%);
+        }
+
+        .btn-dictation:hover {
+            border-color: rgba(6, 182, 212, 0.55);
+            box-shadow: 0 0 16px rgba(6, 182, 212, 0.18);
+        }
+
+        .btn-dictation.active {
+            color: white;
+            border-color: rgba(6, 182, 212, 0.75);
+            background: linear-gradient(135deg, rgba(6, 182, 212, 0.92) 0%, rgba(14, 165, 233, 0.85) 100%);
+            box-shadow: 0 0 22px rgba(6, 182, 212, 0.25);
+        }
+
         .btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
@@ -3213,6 +3231,11 @@
             <button class="btn" id="pause-btn" style="display: none;">
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><rect x="1.5" y="1" width="3" height="10" rx="1"/><rect x="7.5" y="1" width="3" height="10" rx="1"/></svg> Pause
             </button>
+
+            <button class="btn btn-dictation" id="dictate-btn" title="Toggle dictation (Cmd/Ctrl+Shift+D)">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M6 1.2A1.8 1.8 0 0 0 4.2 3v3A1.8 1.8 0 0 0 6 7.8 1.8 1.8 0 0 0 7.8 6V3A1.8 1.8 0 0 0 6 1.2Zm-3 4.1H4A2 2 0 0 0 8 5.3h1a3 3 0 0 1-2.5 2.95V10h1.7v.9H3.8V10h1.7V8.25A3 3 0 0 1 3 5.3Z"/></svg>
+                Dictate
+            </button>
         </div>
         
         <div class="header-actions">
@@ -3314,6 +3337,13 @@
                     <kbd class="kbd">⇧</kbd>
                     <kbd class="kbd">R</kbd>
                     <span>anywhere</span>
+                </div>
+                <div class="shortcut-hint">
+                    <span>Quick dictate:</span>
+                    <kbd class="kbd">⌘</kbd>
+                    <kbd class="kbd">⇧</kbd>
+                    <kbd class="kbd">D</kbd>
+                    <span>to capture a short dictation snippet</span>
                 </div>
             </div>
 
@@ -3847,6 +3877,28 @@ Commands and output will appear here...
                         </label>
                     </div>
 
+                    <div class="settings-row" id="dictation-shortcut-row">
+                        <div class="settings-row-text">
+                            <span>Dictation shortcut</span>
+                            <small>Capture a short dictation snippet and insert it into the focused app</small>
+                        </div>
+                        <button class="settings-action-btn" id="dictation-shortcut-display" type="button" disabled>⌘⇧D</button>
+                    </div>
+
+                    <div class="settings-row" id="dictation-helper-row" style="flex-wrap: wrap;">
+                        <div class="settings-row-text" style="flex: 1; min-width: 0;">
+                            <span>Dictation accessibility</span>
+                            <small id="dictation-helper-detail">Checking whether StenoAI can insert dictated text into other apps…</small>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end;">
+                            <span class="connection-status visible" id="dictation-helper-status-badge">Checking…</span>
+                            <button class="settings-action-btn" id="dictation-helper-refresh-btn" type="button" onclick="refreshDictationHelperStatus()">Refresh</button>
+                            <button class="settings-action-btn" id="dictation-helper-prompt-btn" type="button" onclick="promptDictationAccessibility()">Prompt</button>
+                            <button class="settings-action-btn" id="dictation-helper-open-btn" type="button" onclick="openDictationAccessibilitySettings()">Open Settings</button>
+                        </div>
+                        <small id="dictation-helper-footnote" style="color: var(--text-muted); font-size: 12px; width: 100%; margin-top: 4px;">If Accessibility access is unavailable, dictated text will be copied to your clipboard instead.</small>
+                    </div>
+
                     <div class="settings-row">
                         <div class="settings-row-text">
                             <span>Check for updates</span>
@@ -4106,6 +4158,7 @@ Session started - waiting for activity...
         const startBtn = document.getElementById('start-btn');
         const stopBtn = document.getElementById('stop-btn');
         const pauseBtn = document.getElementById('pause-btn');
+        const dictateBtn = document.getElementById('dictate-btn');
         const settingsBtn = document.getElementById('settings-btn');
         const meetingsList = document.getElementById('meetings-list');
         const emptyState = document.getElementById('empty-state');
@@ -4161,6 +4214,13 @@ Session started - waiting for activity...
         let pausedElapsedTime = 0; // Track elapsed time when paused
         let processingMeetings = new Set();
         let meetingsLastLoaded = 0; // Cache timestamp
+        let dictationUiState = 'idle';
+        let dictationStream = null;
+        let dictationAudioContext = null;
+        let dictationAnalyser = null;
+        let dictationMediaRecorder = null;
+        let dictationChunks = [];
+        let dictationStopReason = 'manual';
         
         // Announcement system variables
         let currentAnnouncement = null;
@@ -4304,6 +4364,381 @@ Session started - waiting for activity...
                     break;
             }
         }
+
+        function chooseDictationMimeType() {
+            const preferredTypes = [
+                'audio/webm;codecs=opus',
+                'audio/webm',
+                'audio/mp4'
+            ];
+
+            return preferredTypes.find(type => window.MediaRecorder && MediaRecorder.isTypeSupported(type)) || '';
+        }
+
+        function getDictationExtension(mimeType) {
+            if (typeof mimeType !== 'string') return 'webm';
+            if (mimeType.includes('mp4')) return 'mp4';
+            if (mimeType.includes('mpeg')) return 'mp3';
+            if (mimeType.includes('wav')) return 'wav';
+            return 'webm';
+        }
+
+        function cleanupDictationCaptureResources() {
+            AudioVisualizer.stop();
+
+            if (dictationStream) {
+                dictationStream.getTracks().forEach(track => track.stop());
+            }
+            dictationStream = null;
+
+            if (dictationAudioContext) {
+                dictationAudioContext.close().catch(() => {});
+            }
+            dictationAudioContext = null;
+            dictationAnalyser = null;
+            dictationMediaRecorder = null;
+            dictationChunks = [];
+        }
+
+        function setDictationUIState(state, detail = '') {
+            dictationUiState = state;
+            dictateBtn.classList.toggle('active', state === 'capturing');
+            dictateBtn.disabled = state === 'processing' || state === 'starting';
+
+            if (state === 'starting') {
+                dictateBtn.innerHTML = '<svg width=\"12\" height=\"12\" viewBox=\"0 0 12 12\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\"><path d=\"M6 1.2v2.1M6 8.7v2.1M1.2 6h2.1M8.7 6h2.1M2.2 2.2l1.5 1.5M8.3 8.3l1.5 1.5M9.8 2.2 8.3 3.7M3.7 8.3 2.2 9.8\"/></svg> Starting...';
+                setStatus('processing', detail || 'Starting dictation...');
+                return;
+            }
+
+            if (state === 'capturing') {
+                dictateBtn.innerHTML = '<svg width=\"12\" height=\"12\" viewBox=\"0 0 12 12\" fill=\"currentColor\"><rect x=\"1\" y=\"1\" width=\"10\" height=\"10\" rx=\"1.5\"/></svg> Stop Dictation';
+                setStatus('recording', detail || 'Dictating...');
+                return;
+            }
+
+            if (state === 'processing') {
+                dictateBtn.innerHTML = '<svg width=\"12\" height=\"12\" viewBox=\"0 0 12 12\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\"><path d=\"M6 1.2v2.1M6 8.7v2.1M1.2 6h2.1M8.7 6h2.1M2.2 2.2l1.5 1.5M8.3 8.3l1.5 1.5M9.8 2.2 8.3 3.7M3.7 8.3 2.2 9.8\"/></svg> Transcribing...';
+                setStatus('processing', detail || 'Transcribing dictation...');
+                return;
+            }
+
+            dictateBtn.innerHTML = '<svg width=\"12\" height=\"12\" viewBox=\"0 0 12 12\" fill=\"currentColor\"><path d=\"M6 1.2A1.8 1.8 0 0 0 4.2 3v3A1.8 1.8 0 0 0 6 7.8 1.8 1.8 0 0 0 7.8 6V3A1.8 1.8 0 0 0 6 1.2Zm-3 4.1H4A2 2 0 0 0 8 5.3h1a3 3 0 0 1-2.5 2.95V10h1.7v.9H3.8V10h1.7V8.25A3 3 0 0 1 3 5.3Z\"/></svg> Dictate';
+            dictateBtn.disabled = false;
+            if (uiState === 'ready') {
+                setStatus('ready', detail || 'Ready');
+            }
+        }
+
+        function getDictationShortcutLabel() {
+            return require('os').platform() === 'darwin' ? '⌘⇧D' : 'Ctrl+Shift+D';
+        }
+
+        function renderDictationHelperStatus(status) {
+            const badge = document.getElementById('dictation-helper-status-badge');
+            const detail = document.getElementById('dictation-helper-detail');
+            const footnote = document.getElementById('dictation-helper-footnote');
+            const promptBtn = document.getElementById('dictation-helper-prompt-btn');
+            const openBtn = document.getElementById('dictation-helper-open-btn');
+            const shortcutDisplay = document.getElementById('dictation-shortcut-display');
+            const shortcutRow = document.getElementById('dictation-shortcut-row');
+
+            if (shortcutDisplay) {
+                shortcutDisplay.textContent = getDictationShortcutLabel();
+            }
+
+            if (shortcutRow && require('os').platform() !== 'darwin') {
+                shortcutRow.style.display = 'none';
+            }
+
+            if (!badge || !detail || !footnote || !promptBtn || !openBtn) {
+                return;
+            }
+
+            if (!status) {
+                badge.textContent = 'Unknown';
+                badge.className = 'connection-status visible error';
+                detail.textContent = 'Unable to load dictation helper status.';
+                footnote.textContent = 'Try refreshing the helper status.';
+                promptBtn.disabled = true;
+                openBtn.disabled = true;
+                return;
+            }
+
+            if (!status.helperAvailable) {
+                badge.textContent = 'Unavailable';
+                badge.className = 'connection-status visible error';
+                detail.textContent = status.error || 'The dictation insertion helper is unavailable.';
+                footnote.textContent = 'Dictation can still transcribe speech, but text will only be copied to your clipboard.';
+                promptBtn.disabled = true;
+                openBtn.disabled = true;
+                return;
+            }
+
+            if (status.accessibilityTrusted) {
+                badge.textContent = status.directInsertionAvailable ? 'Ready' : 'Accessible';
+                badge.className = 'connection-status visible success';
+                detail.textContent = status.directInsertionAvailable
+                    ? 'Accessibility access is enabled. StenoAI can insert dictated text into the focused app.'
+                    : 'Accessibility access is enabled. StenoAI can paste dictated text when direct insertion is unavailable.';
+                footnote.textContent = status.frontmostApp?.name
+                    ? `Current frontmost app: ${status.frontmostApp.name}`
+                    : 'Dictation insertion is ready for the currently focused app.';
+                promptBtn.disabled = true;
+                openBtn.disabled = false;
+                return;
+            }
+
+            badge.textContent = 'Needs Access';
+            badge.className = 'connection-status visible info';
+            detail.textContent = 'Grant Accessibility access so dictation can insert text into other apps.';
+            footnote.textContent = 'Without access, StenoAI will copy dictated text to your clipboard instead of inserting it directly.';
+            promptBtn.disabled = false;
+            openBtn.disabled = false;
+        }
+
+        async function refreshDictationHelperStatus(options = {}) {
+            const refreshBtn = document.getElementById('dictation-helper-refresh-btn');
+            const badge = document.getElementById('dictation-helper-status-badge');
+            const detail = document.getElementById('dictation-helper-detail');
+            const shouldPrompt = Boolean(options.prompt);
+            const quiet = Boolean(options.quiet);
+
+            if (refreshBtn) refreshBtn.disabled = true;
+            if (badge) {
+                badge.textContent = shouldPrompt ? 'Prompting…' : 'Checking…';
+                badge.className = 'connection-status visible';
+            }
+            if (detail) {
+                detail.textContent = shouldPrompt
+                    ? 'Waiting for macOS Accessibility permission status…'
+                    : 'Checking whether StenoAI can insert dictated text into other apps…';
+            }
+
+            try {
+                const channel = shouldPrompt
+                    ? 'prompt-dictation-helper-accessibility'
+                    : 'get-dictation-helper-status';
+                const result = await ipcRenderer.invoke(channel);
+                renderDictationHelperStatus(result);
+
+                if (shouldPrompt && !quiet) {
+                    showModelNotification(
+                        result.accessibilityTrusted
+                            ? 'Accessibility access is enabled for dictation'
+                            : 'Check System Settings to finish granting Accessibility access',
+                        result.accessibilityTrusted ? 'success' : 'error'
+                    );
+                }
+
+                return result;
+            } catch (error) {
+                console.error('Failed to refresh dictation helper status:', error);
+                renderDictationHelperStatus({
+                    helperAvailable: false,
+                    error: error.message
+                });
+                if (!quiet) {
+                    showModelNotification('Failed to check dictation accessibility', 'error');
+                }
+                return null;
+            } finally {
+                if (refreshBtn) refreshBtn.disabled = false;
+            }
+        }
+
+        async function promptDictationAccessibility() {
+            return refreshDictationHelperStatus({ prompt: true });
+        }
+
+        async function openDictationAccessibilitySettings() {
+            try {
+                const result = await ipcRenderer.invoke('open-dictation-accessibility-settings');
+                if (!result.success) {
+                    throw new Error(result.error || 'Unable to open Accessibility settings.');
+                }
+
+                showModelNotification('Opened Accessibility settings', 'success');
+                setTimeout(() => {
+                    refreshDictationHelperStatus({ quiet: true }).catch(() => {});
+                }, 1200);
+            } catch (error) {
+                console.error('Failed to open Accessibility settings:', error);
+                showModelNotification(error.message || 'Failed to open Accessibility settings', 'error');
+            }
+        }
+
+        async function initializeDictationUiState() {
+            const shortcutDisplay = document.getElementById('dictation-shortcut-display');
+            if (shortcutDisplay) {
+                shortcutDisplay.textContent = getDictationShortcutLabel();
+            }
+
+            try {
+                const state = await ipcRenderer.invoke('get-dictation-status');
+                if (state?.status === 'capturing') {
+                    log('Resetting stale dictation capture after renderer initialization');
+                    await ipcRenderer.invoke('cancel-dictation-capture', 'Renderer reloaded before dictation completed').catch(() => {});
+                    setDictationUIState('idle', 'Ready');
+                } else if (state?.status === 'processing') {
+                    setDictationUIState('processing', 'Transcribing dictation...');
+                } else {
+                    setDictationUIState('idle', 'Ready');
+                }
+            } catch (error) {
+                console.error('Failed to initialize dictation state:', error);
+            }
+
+            await refreshDictationHelperStatus({ quiet: true });
+        }
+
+        function showDictationOutcome(result) {
+            const statusMessage = result.success
+                ? 'Dictation inserted'
+                : (result.partialSuccess ? 'Dictation copied to clipboard' : 'Dictation failed');
+            const logMessage = result.message || result.error || statusMessage;
+
+            log(`Dictation result: ${logMessage}`);
+            if (result.text) {
+                debugLog(`Dictation transcript: ${result.text}`);
+            }
+
+            setDictationUIState('idle', statusMessage);
+            setTimeout(() => {
+                if (uiState === 'ready' && dictationUiState === 'idle') {
+                    setStatus('ready', 'Ready');
+                }
+            }, 4000);
+
+            const title = result.success
+                ? 'StenoAI - Dictation Inserted'
+                : (result.partialSuccess ? 'StenoAI - Dictation Ready' : 'StenoAI - Dictation Failed');
+            showDesktopNotification(title, {
+                body: logMessage,
+                requireInteraction: false
+            });
+        }
+
+        async function startDictationCapture(trigger = 'manual') {
+            if (dictationUiState !== 'idle') {
+                log(`Dictation start ignored in state: ${dictationUiState}`);
+                return;
+            }
+
+            if (uiState !== 'ready') {
+                log(`Dictation unavailable while meeting UI state is ${uiState}`);
+                return;
+            }
+
+            setDictationUIState('starting', 'Starting dictation...');
+
+            try {
+                const micResult = await ipcRenderer.invoke('check-microphone-permission');
+                if (!micResult.success || micResult.status !== 'granted') {
+                    const micStatus = micResult.status || 'unknown';
+                    alert(`Dictation blocked: Microphone permission is ${micStatus}.`);
+                    setDictationUIState('idle', 'Ready');
+                    return;
+                }
+
+                const startResult = await ipcRenderer.invoke('start-dictation-capture', { source: trigger });
+                if (!startResult.success) {
+                    log(`Failed to start dictation: ${startResult.error}`);
+                    setDictationUIState('idle', 'Ready');
+                    return;
+                }
+
+                dictationStopReason = 'manual';
+                dictationStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                dictationAudioContext = new AudioContext();
+                const source = dictationAudioContext.createMediaStreamSource(dictationStream);
+                dictationAnalyser = dictationAudioContext.createAnalyser();
+                dictationAnalyser.fftSize = 256;
+                source.connect(dictationAnalyser);
+
+                const mimeType = chooseDictationMimeType();
+                dictationChunks = [];
+                dictationMediaRecorder = mimeType
+                    ? new MediaRecorder(dictationStream, { mimeType })
+                    : new MediaRecorder(dictationStream);
+
+                dictationMediaRecorder.ondataavailable = (event) => {
+                    if (event.data && event.data.size > 0) {
+                        dictationChunks.push(event.data);
+                    }
+                };
+
+                dictationMediaRecorder.onerror = async (event) => {
+                    const message = event.error?.message || 'Unknown dictation capture error';
+                    log(`Dictation capture error: ${message}`);
+                    dictationStopReason = 'cancel';
+                    if (dictationMediaRecorder) {
+                        dictationMediaRecorder.onstop = null;
+                    }
+                    cleanupDictationCaptureResources();
+                    await ipcRenderer.invoke('cancel-dictation-capture', message).catch(() => {});
+                    setDictationUIState('idle', 'Ready');
+                };
+
+                dictationMediaRecorder.onstop = async () => {
+                    const mime = dictationMediaRecorder?.mimeType || mimeType || 'audio/webm';
+                    const blob = new Blob(dictationChunks, { type: mime });
+                    cleanupDictationCaptureResources();
+
+                    if (dictationStopReason === 'cancel') {
+                        await ipcRenderer.invoke('cancel-dictation-capture', 'cancelled').catch(() => {});
+                        setDictationUIState('idle', 'Ready');
+                        return;
+                    }
+
+                    setDictationUIState('processing', 'Transcribing dictation...');
+
+                    try {
+                        const buffer = Buffer.from(await blob.arrayBuffer());
+                        const result = await ipcRenderer.invoke('finish-dictation-capture', {
+                            audioBase64: buffer.toString('base64'),
+                            extension: getDictationExtension(blob.type),
+                            source: trigger,
+                            stopReason: dictationStopReason
+                        });
+                        showDictationOutcome(result);
+                    } catch (error) {
+                        showDictationOutcome({ success: false, partialSuccess: false, error: error.message, message: error.message });
+                    }
+                };
+
+                dictationMediaRecorder.start(250);
+                const vizBars = Array.from(document.querySelectorAll('#waveform .waveform-bar'));
+                AudioVisualizer.startFromAnalyser(vizBars, dictationAnalyser);
+                setDictationUIState('capturing', 'Dictating...');
+                log(`Dictation started (${trigger})`);
+            } catch (error) {
+                log(`Dictation start error: ${error.message}`);
+                cleanupDictationCaptureResources();
+                await ipcRenderer.invoke('cancel-dictation-capture', error.message).catch(() => {});
+                setDictationUIState('idle', 'Ready');
+            }
+        }
+
+        async function stopDictationCapture(reason = 'manual') {
+            if (dictationUiState !== 'capturing' || !dictationMediaRecorder) {
+                return;
+            }
+
+            dictationStopReason = reason;
+            setDictationUIState('processing', reason === 'quit' ? 'Cancelling dictation...' : 'Transcribing dictation...');
+
+            try {
+                dictationMediaRecorder.stop();
+            } catch (error) {
+                log(`Dictation stop error: ${error.message}`);
+                cleanupDictationCaptureResources();
+                await ipcRenderer.invoke('cancel-dictation-capture', error.message).catch(() => {});
+                setDictationUIState('idle', 'Ready');
+            }
+        }
+
+        window.stopDictationCapture = stopDictationCapture;
         
         function startStatusMonitoring() {
             // Only check status when we think we're recording
@@ -5319,6 +5754,11 @@ Session started - waiting for activity...
 
         // Manual start/stop recording functions
         startBtn.addEventListener('click', async () => {
+            if (dictationUiState !== 'idle') {
+                log('Cannot start meeting recording while dictation is active');
+                return;
+            }
+
             // Check microphone permission before allowing recording
             try {
                 const micResult = await ipcRenderer.invoke('check-microphone-permission');
@@ -5386,6 +5826,14 @@ Session started - waiting for activity...
                     AudioVisualizer.stop();
                     setUIState('ready');
                 }
+            }
+        });
+
+        dictateBtn.addEventListener('click', async () => {
+            if (dictationUiState === 'capturing') {
+                await stopDictationCapture('manual');
+            } else if (dictationUiState === 'idle') {
+                await startDictationCapture('manual');
             }
         });
         
@@ -5985,6 +6433,9 @@ Session started - waiting for activity...
                     loadTelemetrySettings().catch(err =>
                         log(`Telemetry settings load failed: ${err.message}`)
                     ),
+                    initializeDictationUiState().catch(err =>
+                        log(`Dictation settings load failed: ${err.message}`)
+                    ),
                     loadStoragePath().catch(err =>
                         log(`Storage path load failed: ${err.message}`)
                     ),
@@ -6502,6 +6953,19 @@ Session started - waiting for activity...
             debugLog(message);
         });
 
+        ipcRenderer.on('dictation-status-changed', (event, state) => {
+            if (!state) return;
+            if (state.status === 'processing' && dictationUiState === 'idle') {
+                setDictationUIState('processing', 'Transcribing dictation...');
+                return;
+            }
+
+            if (state.status === 'idle' && dictationUiState !== 'idle') {
+                cleanupDictationCaptureResources();
+                setDictationUIState('idle', 'Ready');
+            }
+        });
+
         // Listen for macOS shortcut start action
         ipcRenderer.on('shortcut-start-recording', (event, payload = {}) => {
             const shortcutName = typeof payload.sessionName === 'string'
@@ -6509,7 +6973,7 @@ Session started - waiting for activity...
                 : '';
 
             log('Shortcut received: start recording');
-            if (uiState !== 'ready') {
+            if (uiState !== 'ready' || dictationUiState !== 'idle') {
                 log(`Shortcut start ignored in UI state: ${uiState}`);
                 return;
             }
@@ -6551,6 +7015,10 @@ Session started - waiting for activity...
         // Listen for global hotkey toggle recording
         ipcRenderer.on('toggle-recording-hotkey', () => {
             log('Global hotkey received: toggle recording');
+            if (dictationUiState !== 'idle') {
+                log('Recording hotkey ignored while dictation is active');
+                return;
+            }
             if (uiState === 'recording') {
                 // Stop recording
                 stopBtn.click();
@@ -6561,12 +7029,31 @@ Session started - waiting for activity...
             // Ignore if in 'processing' state
         });
 
+        ipcRenderer.on('toggle-dictation-hotkey', async () => {
+            log('Global hotkey received: toggle dictation');
+            if (dictationUiState === 'capturing') {
+                await stopDictationCapture('hotkey');
+            } else if (dictationUiState === 'idle') {
+                await startDictationCapture('hotkey');
+            }
+        });
+
         // Listen for tray menu actions
         ipcRenderer.on('tray-start-recording', () => {
-            if (uiState === 'ready') startBtn.click();
+            if (uiState === 'ready' && dictationUiState === 'idle') startBtn.click();
         });
         ipcRenderer.on('tray-stop-recording', () => {
             if (uiState === 'recording' || uiState === 'paused') stopBtn.click();
+        });
+        ipcRenderer.on('tray-start-dictation', async () => {
+            if (dictationUiState === 'idle') await startDictationCapture('tray');
+        });
+        ipcRenderer.on('tray-stop-dictation', async () => {
+            if (dictationUiState === 'capturing') await stopDictationCapture('tray');
+        });
+        ipcRenderer.on('dictation-cancel-requested', async () => {
+            dictationStopReason = 'cancel';
+            await stopDictationCapture('cancel');
         });
         ipcRenderer.on('tray-open-settings', () => {
             if (!settingsVisible) toggleSettings();
@@ -7019,6 +7506,7 @@ Session started - waiting for activity...
                 settingsPanel.classList.add('open');
                 settingsBackdrop.classList.add('open');
                 loadSettingsVersionInfo();
+                refreshDictationHelperStatus({ quiet: true }).catch(() => {});
             } else {
                 settingsPanel.classList.remove('open');
                 settingsBackdrop.classList.remove('open');

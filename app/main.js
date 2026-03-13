@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, systemPreferences, globalShortcut, safeStorage, Tray, Menu, nativeImage, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, systemPreferences, globalShortcut, safeStorage, Tray, Menu, nativeImage, Notification, clipboard } = require('electron');
 
 // Prevent EPIPE crashes when stdout/stderr pipe is broken (e.g. launching terminal closed)
 process.stdout?.on('error', () => {});
@@ -30,6 +30,39 @@ const SHORTCUT_PROTOCOL = 'stenoai';
 const SHORTCUT_HOST = 'record';
 const SHORTCUT_SESSION_NAME_MAX_LENGTH = 120;
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
+const DICTATION_SHORTCUT = process.platform === 'darwin' ? 'Command+Shift+D' : 'Ctrl+Shift+D';
+const RECORDING_SHORTCUT = process.platform === 'darwin' ? 'Command+Shift+R' : 'Ctrl+Shift+R';
+const DICTATION_ACCESSIBILITY_SETTINGS_URL = 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility';
+
+function hasActiveMeetingCapture() {
+  return currentRecordingProcess !== null || systemAudioRecordingActive;
+}
+
+function hasActiveDictationCapture() {
+  return dictationState.status === 'capturing';
+}
+
+function hasPendingDictationWork() {
+  return dictationState.status === 'capturing' || dictationState.status === 'processing';
+}
+
+function sendRendererEvent(channel, payload) {
+  if (!ensureMainWindow()) {
+    return false;
+  }
+
+  if (mainWindow.webContents.isLoadingMainFrame()) {
+    mainWindow.webContents.once('did-finish-load', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(channel, payload);
+      }
+    });
+    return true;
+  }
+
+  mainWindow.webContents.send(channel, payload);
+  return true;
+}
 
 function extractShortcutUrlFromArgv(argv = []) {
   return argv.find(arg => typeof arg === 'string' && arg.startsWith(`${SHORTCUT_PROTOCOL}://`));
@@ -508,15 +541,6 @@ function createTray() {
   updateTrayMenu();
 }
 
-function updateTrayIcon(recording) {
-  if (!tray) return;
-  const icon = nativeImage.createFromPath(getTrayIconPath(recording));
-  icon.setTemplateImage(true);
-  tray.setImage(icon);
-  tray.setToolTip(recording ? 'StenoAI - Recording' : 'StenoAI');
-  updateTrayMenu();
-}
-
 function showAndFocusWindow() {
   if (mainWindow) {
     mainWindow.show();
@@ -524,9 +548,36 @@ function showAndFocusWindow() {
   }
 }
 
+function getTrayCaptureMode() {
+  if (hasActiveMeetingCapture()) {
+    return 'recording';
+  }
+  if (hasActiveDictationCapture()) {
+    return 'dictation';
+  }
+  return null;
+}
+
+function updateTrayIcon(recording) {
+  if (!tray) return;
+  const activeMode = typeof recording === 'string'
+    ? recording
+    : (recording ? 'recording' : getTrayCaptureMode());
+  const icon = nativeImage.createFromPath(getTrayIconPath(Boolean(activeMode)));
+  icon.setTemplateImage(true);
+  tray.setImage(icon);
+  const tooltip = activeMode === 'dictation'
+    ? 'StenoAI - Dictation'
+    : (activeMode === 'recording' ? 'StenoAI - Recording' : 'StenoAI');
+  tray.setToolTip(tooltip);
+  updateTrayMenu();
+}
+
 function updateTrayMenu() {
   if (!tray) return;
-  const isRecording = currentRecordingProcess !== null || systemAudioRecordingActive;
+  const trayCaptureMode = getTrayCaptureMode();
+  const isRecording = trayCaptureMode === 'recording';
+  const isDictating = trayCaptureMode === 'dictation';
 
   const appVersion = require('./package.json').version;
 
@@ -538,18 +589,37 @@ function updateTrayMenu() {
     {
       label: isRecording ? 'Stop Recording' : 'Start Recording',
       click: () => {
-        if (mainWindow) {
-          mainWindow.webContents.send(isRecording ? 'tray-stop-recording' : 'tray-start-recording');
-        }
+        sendRendererEvent(isRecording ? 'tray-stop-recording' : 'tray-start-recording');
+      }
+    },
+    {
+      label: dictationState.status === 'processing'
+        ? 'Dictation Processing…'
+        : (isDictating ? 'Stop Dictation' : 'Start Dictation'),
+      enabled: !isRecording && dictationState.status !== 'processing',
+      click: () => {
+        sendRendererEvent(isDictating ? 'tray-stop-dictation' : 'tray-start-dictation');
+      }
+    },
+    {
+      label: 'Dictation Helper Status',
+      click: async () => {
+        const status = await getInsertionHelperStatus(false);
+        await dialog.showMessageBox(mainWindow || null, {
+          type: status.success ? 'info' : 'warning',
+          title: 'Dictation Helper',
+          message: status.success
+            ? status.message
+            : (status.error || 'The dictation helper is unavailable.'),
+          detail: status.helperPath ? `Helper path: ${status.helperPath}` : undefined
+        });
       }
     },
     {
       label: 'Settings',
       click: () => {
         showAndFocusWindow();
-        if (mainWindow) {
-          mainWindow.webContents.send('tray-open-settings');
-        }
+        sendRendererEvent('tray-open-settings');
       }
     },
     {
@@ -607,15 +677,17 @@ if (!gotSingleInstanceLock) {
     if (isQuitting) return;
 
     // Use synchronous flag -- systemAudioRecordingActive is updated via IPC on each state change
-    if (currentRecordingProcess || systemAudioRecordingActive) {
+    if (currentRecordingProcess || systemAudioRecordingActive || hasActiveDictationCapture()) {
       event.preventDefault();
       const { response } = await dialog.showMessageBox(mainWindow || null, {
         type: 'warning',
         buttons: ['Cancel', 'Stop & Quit'],
         defaultId: 0,
         cancelId: 0,
-        title: 'Recording in Progress',
-        message: 'A recording is still in progress. Quitting will stop and save the recording.',
+        title: 'Capture in Progress',
+        message: hasActiveDictationCapture()
+          ? 'Dictation is still in progress. Quitting will cancel the current snippet.'
+          : 'A recording is still in progress. Quitting will stop and save the recording.',
       });
       if (response === 1) {
         if (currentRecordingProcess) {
@@ -629,21 +701,29 @@ if (!gotSingleInstanceLock) {
             // Best effort -- file is saved even if processing doesn't start
           }
         }
+        if (hasActiveDictationCapture()) {
+          sendRendererEvent('dictation-cancel-requested', { reason: 'quit' });
+          updateDictationState('idle', {
+            startedAt: null,
+            source: null,
+            lastError: 'Dictation cancelled while quitting'
+          });
+        }
         systemAudioRecordingActive = false;
         updateTrayIcon(false);
         isQuitting = true;
         app.quit();
       }
-    } else if (isProcessing || processingQueue.length > 0) {
+    } else if (isProcessing || processingQueue.length > 0 || dictationState.status === 'processing') {
       event.preventDefault();
-      const jobCount = processingQueue.length + (isProcessing ? 1 : 0);
+      const jobCount = processingQueue.length + (isProcessing ? 1 : 0) + (dictationState.status === 'processing' ? 1 : 0);
       const { response } = await dialog.showMessageBox(mainWindow || null, {
         type: 'warning',
         buttons: ['Cancel', 'Quit Anyway'],
         defaultId: 0,
         cancelId: 0,
         title: 'Processing in Progress',
-        message: `${jobCount} recording${jobCount > 1 ? 's are' : ' is'} still being processed. Quitting will cancel processing.`,
+        message: `${jobCount} task${jobCount > 1 ? 's are' : ' is'} still being processed. Quitting will cancel processing.`,
       });
       if (response === 1) {
         isQuitting = true;
@@ -748,19 +828,30 @@ if (!gotSingleInstanceLock) {
       // Non-fatal - custom path just won't be cached
     }
 
-    // Register global hotkey for toggle recording (Cmd+Shift+R on macOS, Ctrl+Shift+R on Windows/Linux)
-    const hotkeyModifier = process.platform === 'darwin' ? 'Command+Shift+R' : 'Ctrl+Shift+R';
-    const registered = globalShortcut.register(hotkeyModifier, () => {
+    const recordingShortcutRegistered = globalShortcut.register(RECORDING_SHORTCUT, () => {
       console.log('Global hotkey triggered: toggle recording');
-      if (mainWindow) {
-        mainWindow.webContents.send('toggle-recording-hotkey');
-      }
+      sendRendererEvent('toggle-recording-hotkey');
     });
 
-    if (registered) {
-      console.log(`Global hotkey registered: ${hotkeyModifier}`);
+    if (recordingShortcutRegistered) {
+      console.log(`Global hotkey registered: ${RECORDING_SHORTCUT}`);
     } else {
-      console.error(`Failed to register global hotkey: ${hotkeyModifier}`);
+      console.error(`Failed to register global hotkey: ${RECORDING_SHORTCUT}`);
+    }
+
+    const dictationShortcutRegistered = globalShortcut.register(DICTATION_SHORTCUT, () => {
+      console.log('Global hotkey triggered: toggle dictation');
+      if (hasActiveMeetingCapture() && !hasActiveDictationCapture()) {
+        showShortcutNotification('Meeting recording already in progress').catch(() => {});
+        return;
+      }
+      sendRendererEvent('toggle-dictation-hotkey');
+    });
+
+    if (dictationShortcutRegistered) {
+      console.log(`Global dictation hotkey registered: ${DICTATION_SHORTCUT}`);
+    } else {
+      console.error(`Failed to register global dictation hotkey: ${DICTATION_SHORTCUT}`);
     }
 
     if (pendingShortcutUrls.length > 0) {
@@ -870,7 +961,7 @@ ipcMain.handle('request-microphone-permission', async () => {
 // Debug functionality handled by side panel now
 
 // Backend communication - always uses bundled stenoai executable
-function runPythonScript(script, args = [], silent = false, extraEnv = {}) {
+function runPythonScriptCaptured(script, args = [], silent = false, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const backendPath = getBackendPath();
 
@@ -916,18 +1007,177 @@ function runPythonScript(script, args = [], silent = false, extraEnv = {}) {
       if (!silent) {
         sendDebugLog(`Command completed with exit code: ${code}`);
       }
-      if (code === 0) {
-        resolve(stdout);
-      } else {
-        reject(new Error(`Python script failed with code ${code}: ${stderr}`));
-      }
+      resolve({ code, stdout, stderr });
     });
-    
+
     process.on('error', (error) => {
       sendDebugLog(`Command error: ${error.message}`);
       reject(error);
     });
   });
+}
+
+function runPythonScript(script, args = [], silent = false, extraEnv = {}) {
+  return runPythonScriptCaptured(script, args, silent, extraEnv).then((result) => {
+    if (result.code === 0) {
+      return result.stdout;
+    }
+
+    throw new Error(`Python script failed with code ${result.code}: ${result.stderr}`);
+  });
+}
+
+function runCapturedProcess(command, args = [], options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    child.on('close', (code) => {
+      resolve({ code, stdout, stderr });
+    });
+
+    child.on('error', reject);
+
+    if (typeof options.stdinText === 'string') {
+      child.stdin.write(options.stdinText);
+    }
+    child.stdin.end();
+  });
+}
+
+function getInsertionHelperPath() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'helpers', 'macos-insertion-helper');
+  }
+  return path.join(__dirname, '..', 'bin', 'macos-insertion-helper');
+}
+
+async function getInsertionHelperStatus(prompt = false) {
+  const helperPath = getInsertionHelperPath();
+
+  if (process.platform !== 'darwin') {
+    return {
+      success: false,
+      helperAvailable: false,
+      helperPath,
+      error: 'The dictation insertion helper is only available on macOS.'
+    };
+  }
+
+  if (!fs.existsSync(helperPath)) {
+    return {
+      success: false,
+      helperAvailable: false,
+      helperPath,
+      error: 'The native macOS insertion helper is not installed yet. Build it with ./scripts/build-macos-insertion-helper.sh.'
+    };
+  }
+
+  try {
+    const args = ['status'];
+    if (prompt) {
+      args.push('--prompt');
+    }
+    const result = await runCapturedProcess(helperPath, args);
+    const payload = JSON.parse((result.stdout || '').trim() || '{}');
+    return {
+      success: result.code === 0,
+      helperAvailable: true,
+      helperPath,
+      ...payload
+    };
+  } catch (error) {
+    return {
+      success: false,
+      helperAvailable: true,
+      helperPath,
+      error: error.message
+    };
+  }
+}
+
+async function openDictationAccessibilitySettings() {
+  if (process.platform !== 'darwin') {
+    return {
+      success: false,
+      error: 'Accessibility settings are only available on macOS.'
+    };
+  }
+
+  try {
+    await shell.openExternal(DICTATION_ACCESSIBILITY_SETTINGS_URL);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function insertDictationText(text) {
+  const helperPath = getInsertionHelperPath();
+
+  if (!fs.existsSync(helperPath) || process.platform !== 'darwin') {
+    clipboard.writeText(text);
+    return {
+      success: false,
+      partialSuccess: true,
+      helperAvailable: false,
+      copiedToClipboard: true,
+      message: process.platform === 'darwin'
+        ? 'The dictation helper is not installed yet. Transcribed text was copied to the clipboard instead.'
+        : 'Automatic insertion is only supported on macOS. Transcribed text was copied to the clipboard instead.'
+    };
+  }
+
+  try {
+    const result = await runCapturedProcess(helperPath, ['insert', '--stdin', '--mode', 'auto', '--prompt'], {
+      stdinText: text
+    });
+    const payload = JSON.parse((result.stdout || '').trim() || '{}');
+    const partialSuccess = result.code === 2;
+
+    if (result.code === 0 || partialSuccess) {
+      return {
+        success: result.code === 0,
+        partialSuccess,
+        helperAvailable: true,
+        copiedToClipboard: payload.performedMode === 'clipboard',
+        helperResponse: payload,
+        message: payload.message || (partialSuccess ? 'Dictation copied to the clipboard.' : 'Dictation inserted into the focused app.')
+      };
+    }
+
+    clipboard.writeText(text);
+    return {
+      success: false,
+      partialSuccess: true,
+      helperAvailable: true,
+      copiedToClipboard: true,
+      helperResponse: payload,
+      message: `${payload.message || result.stderr || 'Unable to insert dictation into the focused app.'} Transcribed text was copied to the clipboard instead.`
+    };
+  } catch (error) {
+    clipboard.writeText(text);
+    return {
+      success: false,
+      partialSuccess: true,
+      helperAvailable: true,
+      copiedToClipboard: true,
+      message: `Helper invocation failed: ${error.message}. Transcribed text was copied to the clipboard instead.`
+    };
+  }
 }
 
 async function getBackendStatusInternal(silent = true) {
@@ -942,6 +1192,158 @@ async function handleGetStatus() {
     return { success: false, error: error.message };
   }
 }
+
+ipcMain.handle('get-dictation-status', async () => getDictationStatusSnapshot());
+ipcMain.handle('get-dictation-helper-status', async () => getInsertionHelperStatus(false));
+ipcMain.handle('prompt-dictation-helper-accessibility', async () => getInsertionHelperStatus(true));
+ipcMain.handle('open-dictation-accessibility-settings', async () => openDictationAccessibilitySettings());
+
+ipcMain.handle('start-dictation-capture', async (event, options = {}) => {
+  try {
+    if (hasActiveMeetingCapture()) {
+      return { success: false, error: 'A meeting recording is already in progress.' };
+    }
+
+    if (hasPendingDictationWork()) {
+      return { success: false, error: 'Dictation is already active.' };
+    }
+
+    const micStatus = systemPreferences.getMediaAccessStatus('microphone');
+    if (micStatus !== 'granted') {
+      return { success: false, error: `Microphone permission is ${micStatus}.` };
+    }
+
+    updateDictationState('capturing', {
+      startedAt: new Date().toISOString(),
+      source: typeof options.source === 'string' ? options.source : 'manual',
+      lastError: null,
+      lastResult: null
+    });
+    sendDebugLog(`Dictation started (${dictationState.source})`);
+    trackEvent('dictation_started');
+    return getDictationStatusSnapshot();
+  } catch (error) {
+    sendDebugLog(`Failed to start dictation: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('cancel-dictation-capture', async (event, reason = 'cancelled') => {
+  updateDictationState('idle', {
+    startedAt: null,
+    source: null,
+    lastError: reason,
+    lastResult: null
+  });
+  sendDebugLog(`Dictation cancelled: ${reason}`);
+  return getDictationStatusSnapshot();
+});
+
+ipcMain.handle('finish-dictation-capture', async (event, payload = {}) => {
+  let tempDir = null;
+  let tempAudioPath = null;
+
+  try {
+    if (!hasPendingDictationWork()) {
+      return { success: false, error: 'No dictation capture is active.' };
+    }
+
+    const audioBase64 = typeof payload.audioBase64 === 'string' ? payload.audioBase64.trim() : '';
+    if (!audioBase64) {
+      throw new Error('No dictation audio was received.');
+    }
+
+    const extension = typeof payload.extension === 'string' && /^[a-z0-9]+$/i.test(payload.extension)
+      ? payload.extension.toLowerCase()
+      : 'webm';
+
+    updateDictationState('processing', {
+      lastError: null
+    });
+    sendDebugLog('Dictation captured; starting transcription');
+
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stenoai-dictation-'));
+    tempAudioPath = path.join(tempDir, `snippet.${extension}`);
+    fs.writeFileSync(tempAudioPath, Buffer.from(audioBase64, 'base64'));
+
+    const transcriptionCommand = await runPythonScriptCaptured('simple_recorder.py', ['transcribe-only', tempAudioPath], false);
+    let transcription;
+
+    try {
+      transcription = JSON.parse((transcriptionCommand.stdout || '').trim() || '{}');
+    } catch (parseError) {
+      throw new Error(
+        transcriptionCommand.stderr?.trim()
+          || 'Dictation transcription failed without returning valid JSON.'
+      );
+    }
+
+    if (transcriptionCommand.code !== 0 && transcription.success !== false) {
+      transcription.success = false;
+      transcription.error = transcription.error
+        || transcriptionCommand.stderr?.trim()
+        || `Dictation transcription failed with exit code ${transcriptionCommand.code}.`;
+    }
+
+    if (!transcription.success) {
+      throw new Error(transcription.error || 'Dictation transcription failed.');
+    }
+
+    const text = typeof transcription.text === 'string' ? transcription.text.trim() : '';
+    if (!text) {
+      throw new Error('No speech was detected in the dictation snippet.');
+    }
+
+    const insertion = await insertDictationText(text);
+    const response = {
+      success: insertion.success,
+      partialSuccess: Boolean(insertion.partialSuccess),
+      message: insertion.message,
+      text,
+      duration_seconds: transcription.duration_seconds ?? null,
+      language: transcription.language ?? null,
+      insertion
+    };
+
+    sendDebugLog(`Dictation finished: ${response.message}`);
+    trackEvent('dictation_completed', {
+      success: response.success,
+      partial_success: response.partialSuccess,
+      duration_bucket: durationBucket(Number(response.duration_seconds) || 0)
+    });
+
+    updateDictationState('idle', {
+      startedAt: null,
+      source: null,
+      lastText: text,
+      lastError: response.success || response.partialSuccess ? null : response.message,
+      lastResult: response
+    });
+
+    return response;
+  } catch (error) {
+    sendDebugLog(`Dictation failed: ${error.message}`);
+    trackEvent('error_occurred', { error_type: 'dictation' });
+    updateDictationState('idle', {
+      startedAt: null,
+      source: null,
+      lastError: error.message,
+      lastResult: null
+    });
+    return { success: false, partialSuccess: false, error: error.message, message: error.message };
+  } finally {
+    try {
+      if (tempAudioPath && fs.existsSync(tempAudioPath)) {
+        fs.unlinkSync(tempAudioPath);
+      }
+      if (tempDir && fs.existsSync(tempDir)) {
+        fs.rmdirSync(tempDir);
+      }
+    } catch (_) {
+      // Best effort cleanup only.
+    }
+  }
+});
 
 async function handleGetNotifications() {
   try {
@@ -961,6 +1363,9 @@ async function handleGetNotifications() {
 // IPC Handlers - Separate start/stop with better error handling
 ipcMain.handle('start-recording', async (event, sessionName) => {
   try {
+    if (hasPendingDictationWork()) {
+      return { success: false, error: 'Dictation is currently active. Stop dictation before starting a meeting recording.' };
+    }
     sendDebugLog(`Starting recording session: ${sessionName || 'Meeting'}`);
     sendDebugLog('$ python simple_recorder.py start');
 
@@ -1267,7 +1672,8 @@ ipcMain.handle('get-queue-status', async () => {
     isProcessing,
     queueSize: processingQueue.length,
     currentJob: currentProcessingJob?.sessionName || null,
-    hasRecording: currentRecordingProcess !== null || systemAudioRecordingActive
+    hasRecording: currentRecordingProcess !== null || systemAudioRecordingActive,
+    hasDictation: hasPendingDictationWork()
   };
 });
 
@@ -1280,6 +1686,36 @@ let currentProcessingJob = null;
 let ollamaProcess = null;  // Track spawned Ollama process for cleanup on quit
 let ollamaPid = null;      // Store PID separately since unref() disconnects the process
 let ollamaStartedByUs = false;
+let dictationState = {
+  status: 'idle',
+  startedAt: null,
+  source: null,
+  lastText: null,
+  lastError: null,
+  lastResult: null
+};
+
+function getDictationStatusSnapshot() {
+  return {
+    success: true,
+    ...dictationState,
+    isCapturing: dictationState.status === 'capturing',
+    isProcessing: dictationState.status === 'processing',
+    helperAvailable: fs.existsSync(getInsertionHelperPath())
+  };
+}
+
+function updateDictationState(status, updates = {}) {
+  dictationState = {
+    ...dictationState,
+    ...updates,
+    status
+  };
+  updateTrayIcon(getTrayCaptureMode());
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('dictation-status-changed', getDictationStatusSnapshot());
+  }
+}
 
 // Processing queue management
 async function processNextInQueue() {
@@ -1360,6 +1796,9 @@ function addToProcessingQueue(audioFile, sessionName) {
 
 ipcMain.handle('start-recording-ui', async (_, sessionName) => {
   try {
+    if (hasPendingDictationWork()) {
+      return { success: false, error: 'Dictation is currently active. Stop dictation before starting a meeting recording.' };
+    }
     if (currentRecordingProcess) {
       return { success: false, error: 'Recording already in progress' };
     }
